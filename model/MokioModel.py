@@ -57,9 +57,11 @@ class MokioMindConfig(PretrainedConfig):
 import torch
 import math
 import torch.nn as nn
-from typing import Optional, Tuple,List
+from typing import Optional, Tuple,List,Union
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class RMSNorm(nn.Module):
@@ -395,3 +397,42 @@ class MokioMindModel(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         return hidden_states, presents
+    
+class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MokioMindConfig
+
+    def __init__(self, config: MokioMindConfig):
+        super().__init__(config)
+        self.model = MokioMindModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **args,
+    ):
+        h, past_kvs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args,
+        )
+
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+        logits = self.lm_head(h[:, slice_indices, :])
+
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=past_kvs,
+            hidden_states=h,
+        )
