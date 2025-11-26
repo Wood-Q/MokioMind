@@ -400,7 +400,7 @@ class MoEFeedForaward(nn.Module):
                 y[flat_topk_idx==i]=expert(x[flat_topk_idx==i]).to(y.dtype)
             # 加权求和
             # 最后的y意义是每个token经过专家处理后的加权结果
-            y=(y.view(*topk_weight.shepe,-1)*topk_weight.unsqueeze(-1).sum(dim=1))
+            y=(y.view(*topk_weight.shape,-1)*topk_weight.unsqueeze(-1).sum(dim=1))
             y=y.view(*orig_shape)
         # 如果是推理阶段
         else:
