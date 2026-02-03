@@ -21,16 +21,15 @@ class MokioMindConfig(PretrainedConfig):
         rope_theta: int = 1000000,
         inference_rope_scaling: bool = False,
         flash_attention: bool = True,
-        
         ############ MoE ############
-        use_moe:bool=False,
-        num_experts_per_tok:int=2,
-        n_routed_experts:int=4,
-        n_shared_experts:int=1,
-        scoring_func:str='softmax',
-        aux_loss_alpha:float=0.1,
-        seq_aux:bool=True,
-        norm_topk_prob:bool=True,
+        use_moe: bool = False,
+        num_experts_per_tok: int = 2,
+        n_routed_experts: int = 4,
+        n_shared_experts: int = 1,
+        scoring_func: str = "softmax",
+        aux_loss_alpha: float = 0.1,
+        seq_aux: bool = True,
+        norm_topk_prob: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -50,14 +49,14 @@ class MokioMindConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.inference_rope_scaling = inference_rope_scaling
         self.flash_attention = flash_attention
-        self.use_moe=use_moe
-        self.num_experts_per_tok=num_experts_per_tok
-        self.n_routed_experts=n_routed_experts
-        self.n_shared_experts=n_shared_experts
-        self.seq_aux=seq_aux
-        self.norm_topk_prob=norm_topk_prob
-        self.aux_loss_alpha=aux_loss_alpha
-        self.scoring_func=scoring_func
+        self.use_moe = use_moe
+        self.num_experts_per_tok = num_experts_per_tok
+        self.n_routed_experts = n_routed_experts
+        self.n_shared_experts = n_shared_experts
+        self.seq_aux = seq_aux
+        self.norm_topk_prob = norm_topk_prob
+        self.aux_loss_alpha = aux_loss_alpha
+        self.scoring_func = scoring_func
 
         self.rope_scaling = (
             {
@@ -75,7 +74,8 @@ class MokioMindConfig(PretrainedConfig):
 import torch
 import math
 import torch.nn as nn
-from typing import Optional, Tuple,List,Union
+from torch.nn import init
+from typing import Optional, Tuple, List, Union
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
@@ -132,13 +132,13 @@ def precompute_freqs(
 
             freqs = freqs * scale
 
-        t = torch.arange(end, device=freqs.device)
-        freqs = torch.outer(t, freqs).float()
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
 
-        freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
-        freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
 
-        return freqs_cos, freqs_sin
+    return freqs_cos, freqs_sin
 
 
 def apply_rotary_pos_emb(
@@ -265,7 +265,7 @@ class Attention(nn.Module):
                 diagonal=-1,
             )
 
-            scores=scores+causal_mask.unsqueeze(0).unsqueeze(0)
+            scores = scores + causal_mask.unsqueeze(0).unsqueeze(0)
 
             if attention_mask is not None:
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
@@ -273,14 +273,13 @@ class Attention(nn.Module):
                 scores = scores + extended_attention_mask
 
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            scores=self.attn_dropout(scores)
-            output=scores@xv
+            scores = self.attn_dropout(scores)
+            output = scores @ xv
 
-        output=output.transpose(1,2).reshape(
-            bsz,seq_len,-1
-        )
-        output=self.resid_dropout(self.o_proj(output))
-        return output,past_kv
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
+
 
 class FeedForward(nn.Module):
     def __init__(self, config: MokioMindConfig):
@@ -304,53 +303,69 @@ class FeedForward(nn.Module):
     def forward(self, x):
         gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         return self.dropout(self.down_proj(gated))
-    
+
+
 class MoEGate(nn.Module):
-    def __init__(self,config:MokioMindConfig):
+    def __init__(self, config: MokioMindConfig):
         super().__init__()
-        self.config=config
-        self.top_k=config.num_experts_per_tok
-        
-        self.scoring_func=config.scoring_func
-        self.alpha=config.aux_loss_alpha
-        self.seq_aux=config.seq_aux
-        
-        self.norm_topk_prob=config.norm_topk_prob
-        self.gating_dim=config.hidden_size
-        self.weight=nn.Parameter(torch.empty((self.n_routed_experts,self.gating_dim)))
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+
+        self.scoring_func = config.scoring_func
+        self.alpha = config.aux_loss_alpha
+        self.seq_aux = config.seq_aux
+
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gating_dim = config.hidden_size
+        self.weight = nn.Parameter(
+            torch.empty((self.n_routed_experts, self.gating_dim))
+        )
         self.reset_parameters()
-        
-    def reset_parameters(self)->None:
-        init.kaiming_uniform_(self.weight,a=math.sqrt(5))
-        
-    def forward(self,hidden_states):
-        bsz,seq_len,h=hidden_states.shape
-        hidden_states=hidden_states.view(-1,h)
-        logits=F.linear(hidden_states,self.weight,None)
-    
-        if self.scoring_func == 'softmax':
-                scores = logits.softmax(dim=-1)
+
+    def reset_parameters(self) -> None:
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def forward(self, hidden_states):
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)
+        logits = F.linear(hidden_states, self.weight, None)
+
+        if self.scoring_func == "softmax":
+            scores = logits.softmax(dim=-1)
         else:
-            raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
-            
+            raise NotImplementedError(
+                f"insupportable scoring function for MoE gating: {self.scoring_func}"
+            )
+
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
-        
+
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
-                
+
         if self.training and self.alpha > 0.0:
             scores_for_aux = scores
             aux_topk = self.top_k
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
             if self.seq_aux:
-                scores_for_seq_aux=scores_for_aux.view(bsz,seq_len,-1)
-                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
-                ce.scatter_add_(1, topk_idx_for_aux_loss, torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device))
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                ce = torch.zeros(
+                    bsz, self.n_routed_experts, device=hidden_states.device
+                )
+                ce.scatter_add_(
+                    1,
+                    topk_idx_for_aux_loss,
+                    torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device),
+                )
                 ce = ce.div(seq_len * aux_topk / self.n_routed_experts)
-                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(
+                    dim=1
+                ).mean() * self.alpha
             else:
-                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                mask_ce = F.one_hot(
+                    topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
+                )
                 ce = mask_ce.float().mean(0)
                 Pi = scores_for_aux.mean(0)
                 fi = ce * self.n_routed_experts
@@ -358,59 +373,61 @@ class MoEGate(nn.Module):
         else:
             aux_loss = 0
         return topk_weight, topk_idx, aux_loss
-    
+
+
 class MoEFeedForaward(nn.Module):
-    def __init__(self,config:MokioMindConfig):
+    def __init__(self, config: MokioMindConfig):
         super().__init__()
-        self.config=config
+        self.config = config
         # 专家层
-        self.experts=nn.ModuleList(
-            [FeedForward(config)
-             for _ in range(config.n_routed_experts)]
+        self.experts = nn.ModuleList(
+            [FeedForward(config) for _ in range(config.n_routed_experts)]
         )
         # 门控层
-        self.gate=MoEGate(config)
-        if config.n_shared_experts>0:
-            self.shared_experts=nn.ModuleList(
-                [FeedForward(config)
-                 for _ in range(config.n_shared_experts)]
+        self.gate = MoEGate(config)
+        if config.n_shared_experts > 0:
+            self.shared_experts = nn.ModuleList(
+                [FeedForward(config) for _ in range(config.n_shared_experts)]
             )
-    def forward(self,x):
-        identity=x
-        orig_shape=x.shape
-        bsz,seq_len,h=orig_shape
-        
+
+    def forward(self, x):
+        identity = x
+        orig_shape = x.shape
+        bsz, seq_len, h = orig_shape
+
         # 使用门控机制旋转专家
         topk_weight, topk_idx, aux_loss = self.gate(x)
         # 展开x以便处理
-        x=x.view(-1,x.shape[-1])
-        
-        flat_topk_idx=topk_idx.view(-1)
+        x = x.view(-1, x.shape[-1])
+
+        flat_topk_idx = topk_idx.view(-1)
         if self.training:
             # 按照定义的num_experts_per_tok重复输入token
             # 每个token安排num_experts_per_tok个专家处理
-            x=x.repeat_interleave(self.config.num_experts_per_tok,dim=0)
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
             # y是空张量，和x形状相同
-            y=torch.empty_like(x,dtype=torch.float32)
+            y = torch.empty_like(x, dtype=torch.float32)
             # 遍历所有专家
-            for i,expert in enumerate(self.experts):
+            for i, expert in enumerate(self.experts):
                 # 找到所有指向专家i的token
                 # 然后将这些token输入专家i进行处理
                 # 最后将结果放回y对应位置
-                y[flat_topk_idx==i]=expert(x[flat_topk_idx==i]).to(y.dtype)
+                y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)
             # 加权求和
             # 最后的y意义是每个token经过专家处理后的加权结果
-            y=(y.view(*topk_weight.shape,-1)*topk_weight.unsqueeze(-1).sum(dim=1))
-            y=y.view(*orig_shape)
+            y = y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1).sum(dim=1)
+            y = y.view(*orig_shape)
         # 如果是推理阶段
         else:
-            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
+            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(
+                *orig_shape
+            )
         if self.config.n_shared_experts > 0:
             for expert in self.shared_experts:
                 y = y + expert(identity)
         self.aux_loss = aux_loss
         return y
-    
+
     @torch.no_grad()
     # MoE推理方法
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
@@ -441,12 +458,13 @@ class MoEFeedForaward(nn.Module):
             # 加权
             expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
             # 将结果散点加到缓存中对应位置
-            expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
+            expert_cache.scatter_add_(
+                0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
+            )
 
         return expert_cache
-            
-        
-    
+
+
 class MokioMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MokioMindConfig):
         super().__init__()
@@ -460,7 +478,9 @@ class MokioMindBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = FeedForward(config)if not config.use_moe else MoEFeedForaward(config)
+        self.mlp = (
+            FeedForward(config) if not config.use_moe else MoEFeedForaward(config)
+        )
 
     def forward(
         self,
@@ -486,7 +506,8 @@ class MokioMindBlock(nn.Module):
             self.post_attention_layernorm(hidden_states)
         )
         return hidden_states, present_key_value
-    
+
+
 class MokioMindModel(nn.Module):
     def __init__(self, config: MokioMindConfig):
         super().__init__()
@@ -556,10 +577,15 @@ class MokioMindModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
 
-        aux_loss=sum(layer.mlp.aux_loss for layer in self.layers if isinstance(layer.mlp,MoEFeedForaward))
-        
-        return hidden_states, presents,aux_loss
-    
+        aux_loss = sum(
+            layer.mlp.aux_loss
+            for layer in self.layers
+            if isinstance(layer.mlp, MoEFeedForaward)
+        )
+
+        return hidden_states, presents, aux_loss
+
+
 class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MokioMindConfig
 
@@ -578,7 +604,7 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **args,
     ):
-        h, past_kvs,aux_loss = self.model(
+        h, past_kvs, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
