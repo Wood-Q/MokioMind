@@ -1,3 +1,19 @@
+"""
+MokioMind全参数监督微调(Full SFT)脚本
+用于在预训练模型基础上进行指令跟随训练
+
+📚 监督微调(SFT)知识点：
+- 训练目标：让模型学会遵循人类指令
+- 数据格式：问答对、对话数据、任务指令
+- 训练特点：在预训练模型基础上继续训练
+- 关键区别：只对答案部分计算损失，问题部分用mask屏蔽
+
+📚 Full SFT vs LoRA微调：
+- Full SFT：更新所有模型参数，效果更好但需要更多资源
+- LoRA：只更新少量参数，效率高但效果略差
+- 选择原则：资源充足选Full SFT，资源有限选LoRA
+"""
+
 import os
 import sys
 
@@ -15,7 +31,8 @@ from torch import optim, nn         # 优化器和神经网络
 from torch.nn.parallel import DistributedDataParallel  # 分布式并行
 from torch.utils.data import DataLoader, DistributedSampler  # 数据加载
 
-from model.model_minimind import MiniMindConfig     # 模型配置
+# MokioMind相关组件
+from model.MokioModel import MokioMindConfig     # 模型配置
 from dataset.lm_dataset import SFTDataset          # SFT数据集
 from trainer.trainer_utils import (                # 训练工具
     get_lr, Logger, is_main_process, lm_checkpoint, 
@@ -24,45 +41,96 @@ from trainer.trainer_utils import (                # 训练工具
 
 warnings.filterwarnings('ignore')
 
-def train_epoch(epoch,loader,iters,start_step=0,wandb=None):
-    loss_fct=nn.CrossEntropyLoss(reduction='none')
-    start_time=time.time()
+
+def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    """
+    执行单个SFT训练轮次
+    与预训练的主要区别在于数据格式和损失计算方式
     
-    for step,(X,Y,loss_mask) in enumerate(loader,start=start_step+1):
-        X=X.to(args.device)
-        Y=Y.to(args.device)
-        loss_mask=loss_mask.to(args.device)
+    📚 SFT训练关键知识点：
+    1. 数据格式：[instruction + response]格式的问答对
+    2. 损失掩码：只对response部分计算损失，instruction部分mask掉
+    3. 损失函数：仍然是交叉熵，但通过mask控制计算范围
+    4. 训练目标：让模型学会根据指令生成合适的回答
+    
+    📚 SFT vs 预训练的区别：
+    - 预训练：所有token都计算损失，学习语言的统计规律
+    - SFT：只对回答部分计算损失，学习指令跟随能力
+    
+    Args:
+        epoch: 当前训练轮次
+        loader: SFT数据加载器  
+        iters: 总迭代次数
+        start_step: 起始步数（断点续训用）
+        wandb: 实验跟踪工具
+    """
+    # 交叉熵损失函数，不进行自动降维
+    loss_fct = nn.CrossEntropyLoss(reduction='none')
+    start_time = time.time()
+    
+    # 遍历SFT数据批次
+    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
+        # 📚 SFT数据结构说明：
+        # X: 输入序列 [batch_size, seq_len] (instruction + response)
+        # Y: 目标序列 [batch_size, seq_len] (X向右偏移一位)
+        # loss_mask: 损失掩码 [batch_size, seq_len] (只有response部分为1)
         
-        # 动态调整学习率
-        lr=get_lr(epoch*iters+step,args.epochs*iters,args.learning_rate)
+        # 将数据移动到GPU
+        X = X.to(args.device)
+        Y = Y.to(args.device) 
+        loss_mask = loss_mask.to(args.device)
+        
+        # 📚 学习率调度（与预训练相同）
+        # 使用余弦退火策略动态调整学习率
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
-            param_group['lr']=lr
-        
+            param_group['lr'] = lr
+
+        # 📚 混合精度前向传播
         with autocast_ctx:
-            # 前向传播
-            res=model(X)
+            # 模型前向传播
+            res = model(X)
             
-            # 损失计算
-            loss=loss_fct(res.logits.view(-1,res.logits.size(-1)),Y.view(-1)).view(Y.size())
+            # 📚 SFT损失计算详解：
+            # 1. 将3D logits转为2D: [batch*seq, vocab_size]
+            # 2. 将2D targets转为1D: [batch*seq]  
+            # 3. 计算每个位置的交叉熵损失
+            # 4. 恢复为原始形状: [batch_size, seq_len]
+            loss = loss_fct(
+                res.logits.view(-1, res.logits.size(-1)),  # 展平logits
+                Y.view(-1)                                 # 展平targets
+            ).view(Y.size())  # 恢复形状
             
-            loss= (loss * loss_mask).sum() / loss_mask.sum()
+            # 📚 SFT核心：掩码损失计算
+            # 只对response部分（loss_mask=1）计算损失
+            # instruction部分（loss_mask=0）被忽略
+            # 这是SFT与预训练最重要的区别！
+            loss = (loss * loss_mask).sum() / loss_mask.sum()
             
-            loss+=res.aux_loss
+            # 添加MoE辅助损失（如果使用MoE架构）
+            loss += res.aux_loss
             
-            loss=loss/args.acculation_steps
-            
+            # 梯度累积：模拟更大的batch size
+            loss = loss / args.accumulation_steps
+
+        # 📚 混合精度反向传播
         scaler.scale(loss).backward()
-        
-        if (step+1)%args.accumulation_steps==0:
+
+        # 📚 梯度累积和参数更新
+        if (step + 1) % args.accumulation_steps == 0:
+            # 恢复梯度真实值
             scaler.unscale_(optimizer)
-            
-            torch.nn.utils.clip_grad_norm_(model.parameters(),args.grad_clip)
-            
+            # 梯度裁剪防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+            # 执行参数更新
             scaler.step(optimizer)
             scaler.update()
-            
+
+            # 清空梯度，准备下一轮累积
             optimizer.zero_grad(set_to_none=True)
-            
+
+        # 📚 训练日志记录
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps  # 恢复真实损失值
@@ -96,7 +164,8 @@ def train_epoch(epoch,loader,iters,start_step=0,wandb=None):
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
             model.train()  # 恢复训练模式
-            
+
+
 if __name__ == "__main__":
     """
     SFT主函数：监督微调脚本的入口点
@@ -108,7 +177,7 @@ if __name__ == "__main__":
     - 累积步数通常为1：SFT数据质量高，不需要太多累积
     """
     
-    parser = argparse.ArgumentParser(description="MiniMind Full SFT")
+    parser = argparse.ArgumentParser(description="MokioMind Full SFT")
     
     # ========== 基础训练参数 ==========
     parser.add_argument("--save_dir", type=str, default="../out", 
@@ -176,7 +245,7 @@ if __name__ == "__main__":
     # ========== 实验跟踪 ==========
     parser.add_argument("--use_wandb", action="store_true", 
                        help="是否使用wandb")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT", 
+    parser.add_argument("--wandb_project", type=str, default="MokioMind-Full-SFT", 
                        help="wandb项目名")
     
     args = parser.parse_args()
@@ -188,7 +257,7 @@ if __name__ == "__main__":
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
+    lm_config = MokioMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
@@ -202,7 +271,7 @@ if __name__ == "__main__":
         import swanlab as wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        wandb_run_name = f"MokioMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
