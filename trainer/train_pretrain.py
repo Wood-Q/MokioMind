@@ -33,7 +33,7 @@ warnings.filterwarnings("ignore")
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    loss_fct = nn.CrossEntropyLoss(reduction="none")
+    loss_fct = nn.CrossEntropyLoss(reduction="mean")
     start_time = time.time()  # 记录开始时间
 
     # 遍历数据批次
@@ -54,9 +54,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             loss = loss_fct(
                 res.logits.view(-1, res.logits.size(-1)),  # [batch*seq, vocab_size]
                 Y.view(-1),  # [batch*seq]
-            ).view(Y.size())  # 恢复为 [batch_size, seq_len]
-
-            loss = (loss * loss_mask).sum() / loss_mask.sum()
+            )
 
             loss+=res.aux_loss
             
