@@ -107,7 +107,10 @@ class PretrainDataset(Dataset):
         #         CrossEntropyLoss 会自动忽略 -100，不计入 loss
         labels = input_ids.clone()
         labels[input_ids == self.tokenizer.pad_token_id] = -100
-        return input_ids, labels
+
+        # ！修正：返回 attention_mask，使 attention 层能屏蔽 padding token
+        attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+        return input_ids, labels, attention_mask
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -225,8 +228,15 @@ class SFTDataset(Dataset):
         # for i, (x, y) in enumerate(zip(input_ids[:-1], labels[1:])):
         #     print(f"{i:3d}: X={self.tokenizer.decode([x])!r:16s} ---> Y={self.tokenizer.decode([input_ids[i+1]])!r:16s} label={y}")
         # # ================
-        return torch.tensor(input_ids, dtype=torch.long), torch.tensor(
-            labels, dtype=torch.long
+
+        # ！修正：返回 attention_mask，使 attention 层能屏蔽 padding token
+        attention_mask = (
+            torch.tensor(input_ids, dtype=torch.long) != self.tokenizer.pad_token_id
+        ).long()
+        return (
+            torch.tensor(input_ids, dtype=torch.long),
+            torch.tensor(labels, dtype=torch.long),
+            attention_mask,
         )
 
 
@@ -315,6 +325,14 @@ class DPODataset(Dataset):
         y_rejected = torch.tensor(rejected_input_ids[1:], dtype=torch.long)
         mask_rejected = torch.tensor(rejected_loss_mask[1:], dtype=torch.long)
 
+        # ！修正：返回 attention_mask，使 attention 层能屏蔽 padding token
+        attention_mask_chosen = (
+            torch.tensor(chosen_input_ids, dtype=torch.long) != self.padding
+        ).long()
+        attention_mask_rejected = (
+            torch.tensor(rejected_input_ids, dtype=torch.long) != self.padding
+        ).long()
+
         return {
             "x_chosen": x_chosen,
             "y_chosen": y_chosen,
@@ -322,6 +340,8 @@ class DPODataset(Dataset):
             "x_rejected": x_rejected,
             "y_rejected": y_rejected,
             "mask_rejected": mask_rejected,
+            "attention_mask_chosen": attention_mask_chosen,
+            "attention_mask_rejected": attention_mask_rejected,
         }
 
     def generate_loss_mask(self, input_ids):
@@ -421,7 +441,18 @@ class RLAIFDataset(Dataset):
         # 返回原始字符串，不做 tokenize，由 RL trainer 在线处理
         prompt, answer = self.create_chat_prompt(sample["conversations"])
 
-        return {"prompt": prompt, "answer": answer}
+        # ！修正：返回 prompt 对应的 attention_mask token id 列表（由 RL trainer 决定是否使用）
+        prompt_input_ids = self.tokenizer(prompt).input_ids
+        attention_mask = (
+            (
+                torch.tensor(prompt_input_ids, dtype=torch.long)
+                != self.tokenizer.pad_token_id
+            )
+            .long()
+            .tolist()
+        )
+
+        return {"prompt": prompt, "answer": answer, "attention_mask": attention_mask}
 
 
 if __name__ == "__main__":

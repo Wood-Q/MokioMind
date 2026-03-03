@@ -44,13 +44,18 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()  # 记录开始时间
 
     # 遍历所有数据批次
-    for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
-        # 📚 SFT特有：直接从数据集获取input_ids和labels
+    for step, (input_ids, labels, attention_mask) in enumerate(
+        loader, start=start_step + 1
+    ):
+        # 📚 SFT特有：直接从数据集获取input_ids、labels和attention_mask
         # 与Pretrain不同，Pretrain需要(X, Y, loss_mask)三元组和手动计算loss
 
         # 将数据移到指定设备（GPU/CPU）
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
+        attention_mask = attention_mask.to(
+            args.device
+        )  # ！修正：接收并转移attention_mask
 
         # 📚 学习率调度：使用余弦退火+预热策略
         # 从初始学习率逐渐降低到接近0
@@ -62,9 +67,11 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         # 关键运算保持float32精度，其他运算用float16/bfloat16
         with autocast_ctx:
             # 📚 SFT特有：模型直接返回loss
-            # 调用model(input_ids, labels=labels)触发损失函数计算
+            # 调用model(input_ids, labels=labels, attention_mask=attention_mask)触发损失函数计算
             # Pretrain则是调用model(X)只获取logits，需要手动计算loss
-            res = model(input_ids, labels=labels)
+            res = model(
+                input_ids, labels=labels, attention_mask=attention_mask
+            )  # ！修正：加入attention_mask
 
             # SFT总损失 = 主任务loss + 辅助loss（MoE路由辅助）
             loss = res.loss + res.aux_loss

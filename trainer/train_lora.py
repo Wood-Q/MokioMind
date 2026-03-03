@@ -81,13 +81,14 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
 
     # 📚 enumerate的start参数
     # start=start_step + 1: 从指定步数开始计数，用于断点续训时保持step编号连续
-    for step, (input_ids, labels) in enumerate(
+    for step, (input_ids, labels, attention_mask) in enumerate(
         loader, start=start_step + 1
-    ):  # ！修正：原(X, Y, loss_mask)解包3个值，但SFTDataset只返回2个值
+    ):  # ！修正：接收attention_mask
         # 📚 张量设备迁移
         # .to(device): 将CPU上的张量移动到GPU，必须保证数据和模型在同一设备
         input_ids = input_ids.to(args.device)  # 输入序列
         labels = labels.to(args.device)  # 目标序列
+        attention_mask = attention_mask.to(args.device)  # ！修正：转移attention_mask
 
         # 📚 动态学习率调整
         # 使用余弦退火策略，学习率随训练进度平滑下降
@@ -105,8 +106,8 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
         with autocast_ctx:
             # 模型前向传播
             res = model(
-                input_ids, labels=labels
-            )  # ！修正：直接传入labels，由模型内部计算loss
+                input_ids, labels=labels, attention_mask=attention_mask
+            )  # ！修正：加入attention_mask参数
 
             # SFT总损失 = 主任务loss + 辅助loss（MoE路由辅助）
             loss = (

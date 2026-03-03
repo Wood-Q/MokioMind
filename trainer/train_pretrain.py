@@ -36,11 +36,14 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()  # 记录开始时间
 
     # 遍历数据批次
-    for step, (input_ids, labels) in enumerate(
+    for step, (input_ids, labels, attention_mask) in enumerate(
         loader, start=start_step + 1
-    ):  # ！修正：原(X, Y, loss_mask)解包3个值，但PretrainDataset只返回2个值
+    ):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
+        attention_mask = attention_mask.to(
+            args.device
+        )  # ！修正：接收并转移 attention_mask
 
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
 
@@ -50,8 +53,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         with autocast_ctx:
             # 前向传播
             res = model(
-                input_ids, labels=labels
-            )  # ！修正：直接传入labels，由模型内部计算loss
+                input_ids, labels=labels, attention_mask=attention_mask
+            )  # ！修正：直接传入labels和attention_mask，由模型内部计算loss
 
             loss = (
                 res.loss + res.aux_loss

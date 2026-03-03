@@ -81,10 +81,19 @@ def train_epoch(
         y_rejected = batch["y_rejected"].to(args.device)
         mask_chosen = batch["mask_chosen"].to(args.device)
         mask_rejected = batch["mask_rejected"].to(args.device)
+        attention_mask_chosen = batch["attention_mask_chosen"].to(
+            args.device
+        )  # ！修正：加入attention_mask
+        attention_mask_rejected = batch["attention_mask_rejected"].to(
+            args.device
+        )  # ！修正：加入attention_mask
 
         x = torch.cat([x_chosen, x_rejected], dim=0)
         y = torch.cat([y_chosen, y_rejected], dim=0)
         mask = torch.cat([mask_chosen, mask_rejected], dim=0)
+        attention_mask = torch.cat(
+            [attention_mask_chosen, attention_mask_rejected], dim=0
+        )  # ！修正：合并attention_mask
 
         # 📚 学习率调度
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
@@ -95,13 +104,17 @@ def train_epoch(
             # 📚 参考模型前向传播
             # 参考模型冻结，只用于计算baseline概率
             with torch.no_grad():
-                ref_outputs = ref_model(x)
+                ref_outputs = ref_model(
+                    x, attention_mask=attention_mask
+                )  # ！修正：加入attention_mask
                 ref_logits = ref_outputs.logits
             ref_log_probs = logits_to_log_probs(ref_logits, y)
 
             # 📚 策略模型前向传播
             # 策略模型是需要优化的主要模型
-            outputs = model(x)
+            outputs = model(
+                x, attention_mask=attention_mask
+            )  # ！修正：加入attention_mask
             logits = outputs.logits
             policy_log_probs = logits_to_log_probs(logits, y)
 
